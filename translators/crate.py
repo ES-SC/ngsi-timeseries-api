@@ -3,11 +3,16 @@ from datetime import datetime, timedelta
 from translators.base_translator import BaseTranslator
 from utils.common import iter_entity_attrs
 import statistics
+import warnings
+
 
 # NGSI TYPES: Not properly documented so this might change. Based on experimenting with Orion.
 # CRATE TYPES: https://crate.io/docs/reference/sql/data_types.html
+_CRATE_STRING = 'string'
+
 NGSI_TO_CRATE = {
-    "Text": 'string',
+    "Text": _CRATE_STRING,
+    "string": _CRATE_STRING,
     "Number": 'float',
     "Integer": 'long',
     "Boolean": 'boolean',
@@ -15,6 +20,8 @@ NGSI_TO_CRATE = {
     "json:geo": 'geo_shape',
 }
 CRATE_TO_NGSI = dict((v, k) for (k,v) in NGSI_TO_CRATE.items())
+# Consequence of not having well documented NGSI TYPES, I'm leeping consistency for unittesting.
+CRATE_TO_NGSI['string'] = 'Text'
 
 
 class CrateTranslator(BaseTranslator):
@@ -92,7 +99,12 @@ class CrateTranslator(BaseTranslator):
             raise TypeError("Entities expected to be of type list, but got {}".format(type(entities)))
 
         tables = {}             # {table_name -> {column_name -> crate_column_type}}
-        entities_by_tn = {}   # {entity_type -> list(entities)}
+        entities_by_tn = {}   # {table_name -> list(entities)}
+
+        # TEMP DEMO HACK
+        entity_types = [e['type'] for e in entities]
+        if 'AirQualityObserved' in entity_types or 'TrafficFlowObserved' in entity_types:
+            return self._demo_hack(entities)
 
         # Collect tables info
         for e in entities:
@@ -103,7 +115,6 @@ class CrateTranslator(BaseTranslator):
 
             if self.TIME_INDEX_NAME not in e:
                 # Recall it's the reporter's job to ensure each entity comes with a TIME_INDEX attribute.
-                import warnings
                 warnings.warn("Translating entity without TIME_INDEX. {}".format(e))
 
             table['entity_id'] = NGSI_TO_CRATE['Text']  # We intentionally avoid using id as a column name.
@@ -113,7 +124,12 @@ class CrateTranslator(BaseTranslator):
                     table[self.TIME_INDEX_NAME] = NGSI_TO_CRATE['DateTime']
                 else:
                     ngsi_t = e[attr]['type']
-                    crate_t = NGSI_TO_CRATE[ngsi_t]
+                    if ngsi_t not in NGSI_TO_CRATE:
+                        # Treat unsupported types as string
+                        warnings.warn('Unsupported NGSI type: {}. Treating it as string.'.format(ngsi_t))
+                        crate_t = _CRATE_STRING
+                    else:
+                        crate_t = NGSI_TO_CRATE[ngsi_t]
                     table[attr] = crate_t
 
         # Create tables
@@ -133,7 +149,13 @@ class CrateTranslator(BaseTranslator):
                 temp['entity_id'] = {'value': temp.pop('id')}
                 temp[self.TIME_INDEX_NAME] = {'value': temp[self.TIME_INDEX_NAME]}
                 try:
-                    values = tuple(temp[x]['value'] for x in col_names)
+                    values = []
+                    for x in col_names:
+                        val = temp[x]['value']
+                        # Treat unsupported types as string
+                        if tables[tn][x] == _CRATE_STRING and not isinstance(val, str):
+                            val = '{}'.format(val)
+                        values.append(val)
                 except KeyError as e:
                     msg = "Seems like not all entities of same type came with the same set of attributes. {}".format(e)
                     raise NotImplementedError(msg)
@@ -194,3 +216,59 @@ class CrateTranslator(BaseTranslator):
             avg = self.cursor.fetchone()[0]
             values.append(avg)
         return statistics.mean(values)
+
+
+    def _demo_hack(self, entities):
+        """
+        Custom insert of TrafficFlowObserved and AirQualityObserved
+        """
+        # Create table trafficairdata
+        table_name = 'trafficairdata'
+        column_names = ['created_at', 'h', 'id', 'latitude', 'longitude', 'no2', 'p', 'pm10', 'pm25', 't', 'type', 'value']
+        column_types = ['timestamp',  'float', 'integer', 'float', 'float', 'float', 'float', 'float', 'float', 'float', 'string', 'float']
+        assert len(column_names) == len(column_types)
+
+        columns = ','.join('{} {}'.format(n,t) for n,t in zip(column_names, column_types))
+        stmt = "create table if not exists {} ({})".format(table_name, columns)
+        self.cursor.execute(stmt)
+
+        entries = []
+        for e in entities:
+            if e['type'] == 'AirQualityObserved':
+                lat, long = e['location']['value'].split(',')
+                entries.append((
+                    e.get(BaseTranslator.TIME_INDEX_NAME),
+                    e['h']['value'] if 'h' in e else None,
+                    e.get('id'),
+                    lat,
+                    long,
+                    e['no2']['value'] if 'no2' in e else None,
+                    e['p']['value'] if 'p' in e else None,
+                    e['pm10']['value'] if 'pm10' in e else None,
+                    e['pm25']['value'] if 'pm25' in e else None,
+                    e['t']['value'] if 't' in e else None,
+                    'environment',
+                    e['aqi']['value'] if 'aqi' in e else None,
+                ))
+            elif e['type'] == 'TrafficFlowObserved':
+                lat, long = e['location']['value']['coordinates'][0]
+                entries.append((
+                    e[BaseTranslator.TIME_INDEX_NAME],
+                    None,
+                    e.get('id'),
+                    lat,
+                    long,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    'traffic',
+                    e['intensity']['value'],
+                ))
+            else:
+                continue
+
+        stmt = "insert into {} ({}) values ({})".format(table_name, ', '.join(column_names), ('?,' * len(column_names))[:-1])
+        return self.cursor.executemany(stmt, entries)
+
