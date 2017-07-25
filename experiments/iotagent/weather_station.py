@@ -11,6 +11,7 @@ import random
 import requests
 import socket
 import time
+import uuid
 
 # INPUT
 SLEEP = os.environ.get('SLEEP', 10)
@@ -28,7 +29,7 @@ HEADERS_PUT['Content-Type'] = 'application/json'
 
 
 def get_entity():
-    entity_id = "station{}".format(socket.gethostname())
+    entity_id = "station{}".format(uuid.uuid4())
     entity = {
         "id": entity_id,
         "type": "WeatherStation",
